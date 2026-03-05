@@ -1,0 +1,6 @@
+opendartreader
+pykrx
+openpyxl
+requests
+python-dotenv
+yfinance
