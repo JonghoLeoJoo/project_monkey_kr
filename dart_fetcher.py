@@ -190,6 +190,7 @@ BS_MAP: Dict[str, List[str]] = {
     'other_current_a':  ['기타유동자산'],
     'total_noncurrent_a': ['비유동자산'],
     'ppe_net':          ['유형자산'],
+    'rou_assets':       ['사용권자산'],
     'goodwill':         ['영업권'],
     'intangibles':      ['무형자산'],
     'lt_investments':   ['장기금융상품', '기타포괄손익-공정가치금융자산',
@@ -226,6 +227,9 @@ CF_MAP: Dict[str, List[str]] = {
     'cf_from_ops':      ['영업에서 창출된 현금흐름', '영업에서 창출된 현금'],
     'net_income_cf':    ['당기순이익'],
     'adjustments':      ['조정'],
+    'cf_depreciation':  ['감가상각비'],
+    'cf_amortization':  ['무형자산상각비', '무형자산 상각비'],
+    'cf_rou_depr':      ['사용권자산상각비', '사용권자산 상각비', '사용권자산감가상각비'],
     'wc_changes':       ['영업활동으로 인한 자산부채의 변동'],
     'interest_paid':    ['이자의 지급'],
     'interest_received': ['이자의 수취'],
@@ -510,19 +514,22 @@ def extract_financial_data(corp_code: str, years: List[int],
         elif cogs is None and rev is not None and gp is not None:
             is_data['cogs'][yr] = rev - gp
 
-    # EBITDA = Operating Income + D&A (use CF D&A if IS doesn't have it)
+    # EBITDA = Operating Income + D&A
+    # Priority: 1) CF 감가상각비 (direct from CF adjustments)
+    #           2) PPE schedule inference (filled later by _fill_da_from_cf)
     da_data: Dict[int, Optional[float]] = {}
     amort_data: Dict[int, Optional[float]] = {}
     for yr in years:
-        # Try IS depreciation first, then CF adjustments
-        da_val = is_data.get('da', {}).get(yr)
-        if da_val is None:
-            # Use CF adjustments as proxy
-            da_val = cf_data.get('adjustments', {}).get(yr)
-            # Actually adjustments includes more than D&A.  Better: try capex proxy.
-            da_val = None  # Leave as None; will derive from CF
+        # Sum all depreciation/amortization items from CF adjustments
+        cf_depr = cf_data.get('cf_depreciation', {}).get(yr)
+        cf_amort = cf_data.get('cf_amortization', {}).get(yr)
+        cf_rou = cf_data.get('cf_rou_depr', {}).get(yr)
+        # Combine all available D&A components
+        da_components = [v for v in [cf_depr, cf_rou] if v is not None]
+        da_val = sum(abs(v) for v in da_components) if da_components else None
         da_data[yr] = da_val
-        amort_data[yr] = is_data.get('amortization', {}).get(yr)
+        amort_val = abs(cf_amort) if cf_amort is not None else None
+        amort_data[yr] = amort_val
 
     ebitda: Dict[int, Optional[float]] = {}
     for yr in years:
@@ -599,6 +606,7 @@ def extract_financial_data(corp_code: str, years: List[int],
             'other_current_a':  bs_data['other_current_a'],
             'total_current_a':  bs_data['total_current_a'],
             'ppe_net':          bs_data['ppe_net'],
+            'rou_assets':       bs_data.get('rou_assets', {yr: None for yr in years}),
             'goodwill':         bs_data.get('goodwill', {yr: None for yr in years}),
             'intangibles':      bs_data.get('intangibles', {yr: None for yr in years}),
             'lt_investments':   bs_data.get('lt_investments', {yr: None for yr in years}),
@@ -626,6 +634,10 @@ def extract_financial_data(corp_code: str, years: List[int],
             'sbc':          sbc,
             'operating_cf': cf_data['operating_cf'],
             'capex':        cf_data.get('capex', {yr: None for yr in years}),
+            'intangible_acq': cf_data.get('intangible_acq', {yr: None for yr in years}),
+            'cf_depreciation': cf_data.get('cf_depreciation', {yr: None for yr in years}),
+            'cf_amortization': cf_data.get('cf_amortization', {yr: None for yr in years}),
+            'cf_rou_depr':  cf_data.get('cf_rou_depr', {yr: None for yr in years}),
             'acquisitions': cf_data.get('acquisitions', {yr: None for yr in years}),
             'investing_cf': cf_data['investing_cf'],
             'dividends':    cf_data.get('dividends_paid', {yr: None for yr in years}),
@@ -644,41 +656,69 @@ def extract_financial_data(corp_code: str, years: List[int],
     return financial_data
 
 
-def _fill_da_from_cf(fd: Dict, years: List[int]) -> None:
-    """If IS D&A is missing, try to use CF capex and PPE schedule to infer it.
+def _infer_asset_depr(asset_begin, asset_end, acquisitions_yr):
+    """Infer depreciation/amortization from asset schedule:
+    Depr = Asset_begin + |Acquisitions| - Asset_end
+    """
+    if (asset_begin is not None and asset_end is not None
+            and acquisitions_yr is not None):
+        inferred = asset_begin + abs(acquisitions_yr) - asset_end
+        if inferred > 0:
+            return inferred
+    return None
 
-    Fallback: use capex * 0.7 as a rough D&A proxy (many Korean cos don't
-    separately tag D&A in IS).
+
+def _fill_da_from_cf(fd: Dict, years: List[int]) -> None:
+    """Fill D&A and amortization when not directly available from CF.
+
+    Uses asset schedule inference:
+      PPE depreciation = PPE_begin + |Capex| - PPE_end
+      Intangible amort = Intangibles_begin + |Intangible_acq| - Intangibles_end
+
+    Fallback: use capex * 0.7 as a rough D&A proxy.
     """
     da = fd['income_statement']['da']
+    am = fd['income_statement']['amortization']
     capex = fd['cash_flow']['capex']
     ppe = fd['balance_sheet']['ppe_net']
+    intangibles = fd['balance_sheet'].get('intangibles', {})
+    intangible_acq = fd['cash_flow'].get('intangible_acq', {})
+
+    sorted_years = sorted(years)
 
     for yr in years:
         if da.get(yr) is not None:
             continue
-        # D&A = Beginning PPE + Capex - Ending PPE (if we have consecutive years)
-        sorted_years = sorted(years)
+        # Infer PPE depreciation from asset schedule
         idx = sorted_years.index(yr) if yr in sorted_years else -1
         if idx > 0:
             prior_yr = sorted_years[idx - 1]
-            ppe_begin = ppe.get(prior_yr)
-            ppe_end = ppe.get(yr)
-            capex_yr = capex.get(yr)
-            if ppe_begin is not None and ppe_end is not None and capex_yr is not None:
-                inferred_da = ppe_begin + abs(capex_yr) - ppe_end
-                if inferred_da > 0:
-                    da[yr] = inferred_da
-                    continue
+            inferred = _infer_asset_depr(
+                ppe.get(prior_yr), ppe.get(yr), capex.get(yr))
+            if inferred is not None:
+                da[yr] = inferred
+                continue
         # Rough fallback: 70% of capex
         capex_yr = capex.get(yr)
         if capex_yr is not None and abs(capex_yr) > 0:
             da[yr] = abs(capex_yr) * 0.7
 
-    # Update EBITDA with corrected D&A
+    # Infer intangible amortization from intangibles schedule
+    for yr in years:
+        if am.get(yr) is not None:
+            continue
+        idx = sorted_years.index(yr) if yr in sorted_years else -1
+        if idx > 0:
+            prior_yr = sorted_years[idx - 1]
+            inferred = _infer_asset_depr(
+                intangibles.get(prior_yr), intangibles.get(yr),
+                intangible_acq.get(yr))
+            if inferred is not None:
+                am[yr] = inferred
+
+    # Update EBITDA with corrected D&A + amortization
     ebitda = fd['income_statement']['ebitda']
     oi = fd['income_statement']['operating_income']
-    am = fd['income_statement']['amortization']
     for yr in years:
         if oi.get(yr) is not None:
             d = abs(da.get(yr) or 0)
@@ -769,50 +809,124 @@ def _get_shares(stock_code: str, years: List[int]) -> Dict[int, Optional[float]]
 # 3.  LTM (LAST TWELVE MONTHS) ANNUALIZATION
 # =========================================================================
 
+def _sum_from_dfs(dfs, names, col='thstrm_amount', sj_div=None):
+    """Sum a metric across multiple DataFrames (for standalone quarter accumulation)."""
+    total = 0.0
+    found_any = False
+    for df in dfs:
+        val = _extract_from_df(df, names, col=col, sj_div=sj_div)
+        if val is not None:
+            total += val
+            found_any = True
+    return total if found_any else None
+
+
+def _sum_ppe_from_dfs(dfs, col='thstrm_amount'):
+    """Sum individual PPE acquisitions across multiple DataFrames."""
+    total = 0.0
+    found_any = False
+    for df in dfs:
+        val = _sum_ppe_acquisitions(df, col=col)
+        if val is not None:
+            total += val
+            found_any = True
+    return total if found_any else None
+
+
 def compute_ltm(corp_code: str, latest_annual_year: int,
                 financial_data: Dict) -> Optional[int]:
-    """Attempt to compute LTM financials from quarterly reports.
+    """Compute quarterly-based financials from the latest quarterly filing.
 
-    If a Q3 report exists for ``latest_annual_year + 1``, computes:
-        LTM = Annual(Y) + Cumulative-Q3(Y+1) - Cumulative-Q3(Y)
+    Produces TWO sets of data when quarterly data is available:
 
-    Returns the LTM label year (e.g. ``latest_annual_year + 1``) if successful,
-    or *None* if no quarterly data is available.
+    1. **Q cumulative** — stored under ``ltm_year`` in the normal data dicts
+       and added to ``financial_data['years']``.  For a Q3 filing this is the
+       9-month (Q1-Q3) cumulative.  Column label: ``'3Q2025'``.
+
+    2. **Annualized** — stored in ``financial_data['annualized']``.
+       Trailing 12 months: ``Annual(Y) + Q_cum(Y+1) - Q_cum(Y)``
+       i.e. Q4(Y) standalone + Q_cum(Y+1).  Column label: ``'Ann.3Q2025'``.
+
+    DART quarterly reports may return standalone quarter values (not cumulative).
+    This function detects standalone vs cumulative and sums individual quarters
+    when necessary to produce correct cumulative and annualized figures.
+
+    Returns the year label (e.g. ``2025``) if successful, or *None*.
     """
     dart = _get_dart()
     next_year = latest_annual_year + 1
 
-    # Try Q3 (reprt_code='11014'), then semi-annual ('11012'), then Q1 ('11013')
-    for reprt_code, label in [('11014', 'Q3'), ('11012', 'H1'), ('11013', 'Q1')]:
+    def _fetch(yr, rc):
         try:
             with _suppress_stdout():
-                q_current = dart.finstate_all(corp_code, next_year, reprt_code=reprt_code)
+                df = dart.finstate_all(corp_code, yr, reprt_code=rc)
+            return df if df is not None and not df.empty else None
         except Exception:
-            q_current = None
-        if q_current is None or q_current.empty:
+            return None
+
+    # Quarter configs: (reprt_code, label, n_quarters, component_codes)
+    # component_codes = individual quarter report codes needed if standalone
+    QUARTER_CONFIGS = [
+        ('11014', 'Q3', 3, ['11013', '11012', '11014']),  # Q1 + Q2 + Q3
+        ('11012', 'H1', 2, ['11013', '11012']),            # Q1 + Q2
+        ('11013', 'Q1', 1, ['11013']),                     # Q1 only
+    ]
+
+    for reprt_code, label, n_quarters, component_codes in QUARTER_CONFIGS:
+        q_latest = _fetch(next_year, reprt_code)
+        if q_latest is None:
             continue
 
-        # Also need same quarter of the prior year
-        try:
-            with _suppress_stdout():
-                q_prior = dart.finstate_all(corp_code, latest_annual_year,
-                                            reprt_code=reprt_code)
-        except Exception:
-            q_prior = None
-        if q_prior is None or q_prior.empty:
-            continue
+        # ── Detect standalone vs cumulative ──────────────────────────────
+        # Compare latest quarter's revenue to annual revenue.
+        # If Q_rev < FY_rev * 0.5 → standalone (one quarter ≈ 25% of FY)
+        # If Q_rev > FY_rev * 0.5 → cumulative (multiple quarters ≈ 75%)
+        fy_rev = financial_data['income_statement'].get('revenue', {}).get(latest_annual_year)
+        q_rev = _extract_from_df(q_latest, IS_MAP['revenue'],
+                                 col='thstrm_amount', sj_div='IS')
+        is_standalone = (q_rev is not None and fy_rev is not None
+                         and fy_rev > 0 and q_rev < fy_rev * 0.5)
+
+        if is_standalone and n_quarters > 1:
+            print(f"  Quarterly data is standalone - summing Q1"
+                  f"{'..Q' + str(n_quarters) if n_quarters > 1 else ''}"
+                  f" {next_year} for cumulative...")
+            # Fetch all component quarters for current and prior year
+            cur_dfs = [_fetch(next_year, rc) for rc in component_codes]
+            cur_dfs = [df for df in cur_dfs if df is not None]
+            pri_dfs = [_fetch(latest_annual_year, rc) for rc in component_codes]
+            pri_dfs = [df for df in pri_dfs if df is not None]
+
+            if not cur_dfs:
+                continue
+        else:
+            if is_standalone:
+                print(f"  Using {label} {next_year} data (standalone = cumulative for Q1)...")
+            else:
+                print(f"  Using {label} {next_year} data (cumulative)...")
+            cur_dfs = [q_latest]
+            q_prior = _fetch(latest_annual_year, reprt_code)
+            if q_prior is None:
+                continue
+            pri_dfs = [q_prior]
+
+        # The latest quarter's report is always used for BS (point-in-time)
+        bs_df = q_latest
 
         print(f"  Computing LTM using {label} {next_year} data...")
 
-        # For IS and CF items: LTM = Annual(Y) + Q-cumulative(Y+1) - Q-cumulative(Y)
-        # For BS items: just use the quarterly BS (point-in-time)
         years = financial_data['years']
-        ltm_year = next_year  # label for the LTM column
+        ltm_year = next_year
 
         # Add ltm_year to years list
         if ltm_year not in years:
             years.insert(0, ltm_year)
             financial_data['years'] = years
+
+        # Prepare annualized data containers
+        ann_is: Dict[str, Optional[float]] = {}
+        ann_cf: Dict[str, Optional[float]] = {}
+        ann_bs: Dict[str, Optional[float]] = {}
 
         # IS metrics
         for key, names in IS_MAP.items():
@@ -820,14 +934,17 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
             if fd_key not in financial_data['income_statement']:
                 continue
             annual_val = financial_data['income_statement'][fd_key].get(latest_annual_year)
-            q_cur_val = _extract_from_df(q_current, names, col='thstrm_amount', sj_div='IS')
-            q_pri_val = _extract_from_df(q_prior, names, col='thstrm_amount', sj_div='IS')
+            q_cur_val = _sum_from_dfs(cur_dfs, names, sj_div='IS')
+            q_pri_val = _sum_from_dfs(pri_dfs, names, sj_div='IS')
+
+            # Q cumulative → stored under ltm_year in normal data dicts
+            financial_data['income_statement'][fd_key][ltm_year] = q_cur_val
+
+            # Annualized = Annual(Y) + Q_cum(Y+1) - Q_cum(Y)
             if annual_val is not None and q_cur_val is not None and q_pri_val is not None:
-                financial_data['income_statement'][fd_key][ltm_year] = (
-                    annual_val + q_cur_val - q_pri_val
-                )
+                ann_is[fd_key] = annual_val + q_cur_val - q_pri_val
             else:
-                financial_data['income_statement'][fd_key][ltm_year] = None
+                ann_is[fd_key] = None
 
         # CF metrics
         for key, names in CF_MAP.items():
@@ -835,37 +952,110 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
             if fd_key not in financial_data['cash_flow']:
                 continue
             annual_val = financial_data['cash_flow'][fd_key].get(latest_annual_year)
-            q_cur_val = _extract_from_df(q_current, names, col='thstrm_amount', sj_div='CF')
-            q_pri_val = _extract_from_df(q_prior, names, col='thstrm_amount', sj_div='CF')
+            q_cur_val = _sum_from_dfs(cur_dfs, names, sj_div='CF')
+            q_pri_val = _sum_from_dfs(pri_dfs, names, sj_div='CF')
+
+            financial_data['cash_flow'][fd_key][ltm_year] = q_cur_val
+
             if annual_val is not None and q_cur_val is not None and q_pri_val is not None:
-                financial_data['cash_flow'][fd_key][ltm_year] = (
-                    annual_val + q_cur_val - q_pri_val
-                )
+                ann_cf[fd_key] = annual_val + q_cur_val - q_pri_val
             else:
-                financial_data['cash_flow'][fd_key][ltm_year] = None
+                ann_cf[fd_key] = None
 
-        # Capex fallback for LTM: sum individual PPE items if primary failed
+        # Capex fallback: sum individual PPE items
         if financial_data['cash_flow'].get('capex', {}).get(ltm_year) is None:
-            annual_capex = financial_data['cash_flow'].get('capex', {}).get(latest_annual_year)
-            q_cur_capex = _sum_ppe_acquisitions(q_current, col='thstrm_amount')
-            q_pri_capex = _sum_ppe_acquisitions(q_prior, col='thstrm_amount')
-            if annual_capex is not None and q_cur_capex is not None and q_pri_capex is not None:
-                financial_data['cash_flow']['capex'][ltm_year] = (
-                    annual_capex + q_cur_capex - q_pri_capex
-                )
+            q_cur_capex = _sum_ppe_from_dfs(cur_dfs)
+            financial_data['cash_flow']['capex'][ltm_year] = q_cur_capex
 
-        # BS metrics: use quarterly BS directly (point-in-time)
+        if 'capex' not in ann_cf or ann_cf.get('capex') is None:
+            annual_capex = financial_data['cash_flow'].get('capex', {}).get(latest_annual_year)
+            q_cur_capex = (financial_data['cash_flow']['capex'].get(ltm_year)
+                           or _sum_ppe_from_dfs(cur_dfs))
+            q_pri_capex = _sum_ppe_from_dfs(pri_dfs)
+            if annual_capex is not None and q_cur_capex is not None and q_pri_capex is not None:
+                ann_cf['capex'] = annual_capex + q_cur_capex - q_pri_capex
+
+        # BS metrics: use latest quarterly BS directly (point-in-time)
         for key, names in BS_MAP.items():
             if key not in financial_data['balance_sheet']:
                 continue
-            val = _extract_from_df(q_current, names, col='thstrm_amount', sj_div='BS')
+            val = _extract_from_df(bs_df, names, col='thstrm_amount', sj_div='BS')
             financial_data['balance_sheet'][key][ltm_year] = val
+            ann_bs[key] = val  # BS is point-in-time, same for Q and annualized
 
-        # Recompute derived metrics for LTM year
-        # First fill D&A (was not in IS_MAP, needs PPE schedule inference).
-        # Pass full years so the PPE-schedule method can find the prior year.
+        # Recompute derived metrics for Q cumulative year
         _fill_da_from_cf(financial_data, financial_data['years'])
         _recompute_derived(financial_data, ltm_year)
+
+        # Build annualized derived metrics
+        # D&A: try CF direct extraction first, then PPE schedule inference
+        ann_cf_depr = ann_cf.get('cf_depreciation')
+        ann_cf_rou = ann_cf.get('cf_rou_depr')
+        ann_cf_amort = ann_cf.get('cf_amortization')
+        ann_oi = ann_is.get('operating_income')
+
+        # Combine D&A from CF components if available
+        da_parts = [v for v in [ann_cf_depr, ann_cf_rou] if v is not None]
+        ann_da = sum(abs(v) for v in da_parts) if da_parts else None
+        ann_amort = abs(ann_cf_amort) if ann_cf_amort is not None else None
+
+        if ann_da is None and ann_oi is not None:
+            # Derive D&A from PPE schedule for annualized period
+            ppe_begin = financial_data['balance_sheet'].get('ppe_net', {}).get(latest_annual_year)
+            ppe_end = ann_bs.get('ppe_net')
+            ann_capex = ann_cf.get('capex')
+            if ppe_begin and ppe_end and ann_capex:
+                ann_da = _infer_asset_depr(ppe_begin, ppe_end, ann_capex)
+            if ann_da is None and ann_capex:
+                ann_da = abs(ann_capex) * 0.7
+
+        if ann_amort is None:
+            # Infer intangible amortization from intangibles schedule
+            intang_begin = financial_data['balance_sheet'].get('intangibles', {}).get(latest_annual_year)
+            intang_end = ann_bs.get('intangibles')
+            ann_intang_acq = ann_cf.get('intangible_acq')
+            if intang_begin is not None and intang_end is not None and ann_intang_acq is not None:
+                ann_amort = _infer_asset_depr(intang_begin, intang_end, ann_intang_acq)
+
+        ann_is['da'] = ann_da
+        ann_is['amortization'] = ann_amort
+
+        # Annualized EBITDA
+        if ann_oi is not None:
+            ann_is['ebitda'] = ann_oi + (ann_da or 0) + (ann_is.get('amortization') or 0)
+        else:
+            ann_is['ebitda'] = None
+
+        # Annualized FCF
+        ann_opcf = ann_cf.get('operating_cf')
+        ann_capex_val = ann_cf.get('capex')
+        if ann_opcf is not None and ann_capex_val is not None:
+            ann_cf['fcf'] = ann_opcf - abs(ann_capex_val)
+        else:
+            ann_cf['fcf'] = None
+
+        # Annualized GP
+        ann_rev = ann_is.get('revenue')
+        ann_cogs = ann_is.get('cogs')
+        if ann_is.get('gross_profit') is None and ann_rev and ann_cogs:
+            ann_is['gross_profit'] = ann_rev - ann_cogs
+
+        # Store annualized data and metadata
+        q_short = label  # 'Q3', 'H1', or 'Q1'
+        financial_data['annualized'] = {
+            'label': f'Ann.{q_short}{next_year}',
+            'year': next_year,
+            'income_statement': ann_is,
+            'balance_sheet': ann_bs,
+            'cash_flow': ann_cf,
+        }
+        financial_data['ltm_info'] = {
+            'ltm_year': ltm_year,
+            'quarter': q_short,
+            'base_year': latest_annual_year,
+            'q_label': f'{q_short}{next_year}',
+            'ann_label': f'Ann.{q_short}{next_year}',
+        }
 
         return ltm_year
 

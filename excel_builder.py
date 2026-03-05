@@ -5,7 +5,7 @@ Sheet 1 "Financial Statements" : historical Income Statement, Balance Sheet,
                                    Cash Flow Statement + balance check
 Sheet 2 "DCF Model"            : 5-year discounted cash flow valuation
 
-All amounts displayed in KRW (억원, hundred millions).
+All amounts displayed in KRW (원).
 Data sourced from DART (Korean Financial Supervisory Service).
 """
 
@@ -42,7 +42,7 @@ BOT_THICK = Border(bottom=_thick)
 TOP_THIN  = Border(top=_thin)
 
 # ── Number formats (KRW adapted) ─────────────────────────────────────────────
-FMT_KRW     = '#,##0'            # e.g. 3,008,709  (억원)
+FMT_KRW     = '#,##0'            # e.g. 3,008,709  (KRW)
 FMT_PCT     = '0.0%'
 FMT_MULT    = '0.0x'
 FMT_INT     = '#,##0'
@@ -150,16 +150,38 @@ def _write_financial_statements(ws, company_info, financial_data):
     """
     years_desc = financial_data['years']                # newest first
     years = list(reversed(years_desc))                  # oldest first for display
-    n    = len(years)
     inc  = financial_data['income_statement']
     bs   = financial_data['balance_sheet']
     cf   = financial_data['cash_flow']
 
+    # ── Annualized column setup ──────────────────────────────────────────
+    has_ann = 'annualized' in financial_data and 'ltm_info' in financial_data
+    _ltm_info = financial_data.get('ltm_info', {})
+    ANN_YEAR = None
+    if has_ann:
+        ANN_YEAR = years[-1] + 0.5          # sentinel key for annualized col
+        _ann_src = financial_data['annualized']
+        _ann_is = _ann_src.get('income_statement', {})
+        _ann_bs = _ann_src.get('balance_sheet', {})
+        _ann_cf = _ann_src.get('cash_flow', {})
+        for key in inc:
+            if isinstance(inc[key], dict):
+                inc[key][ANN_YEAR] = _ann_is.get(key)
+        for key in bs:
+            if isinstance(bs[key], dict):
+                bs[key][ANN_YEAR] = _ann_bs.get(key)
+        for key in cf:
+            if isinstance(cf[key], dict):
+                cf[key][ANN_YEAR] = _ann_cf.get(key)
+        years.append(ANN_YEAR)
+
+    n    = len(years)
+
     # ── Projection setup ────────────────────────────────────────────────
-    latest_yr      = years[-1]
+    latest_yr      = max(yr for yr in years if isinstance(yr, int))
     proj_years     = [latest_yr + i for i in range(1, 6)]
     n_proj         = 5
-    total_cols     = 1 + n + n_proj          # label + hist + proj
+    total_cols     = 1 + n + n_proj          # label + hist (+ann) + proj
     proj_start_col = 2 + n                   # first projection column
 
     def _cl(i: int) -> str:
@@ -198,6 +220,24 @@ def _write_financial_statements(ws, company_info, financial_data):
         _style(c, fill_hex=fill, bold=bold)
         return c
 
+    def _fix_ann_headers(hdr_row):
+        """Overwrite ltm and ann column headers with proper labels."""
+        if not has_ann:
+            return
+        ltm_yr = _ltm_info['ltm_year']
+        ltm_idx = years.index(ltm_yr)
+        c = ws.cell(row=hdr_row, column=2 + ltm_idx,
+                    value=_ltm_info['q_label'])
+        _style(c, fill_hex=DARK_BLUE, bold=True, font_color=WHITE,
+               h_align='center')
+        c.border = THIN_BOX
+        ann_idx = years.index(ANN_YEAR)
+        c = ws.cell(row=hdr_row, column=2 + ann_idx,
+                    value=_ltm_info['ann_label'])
+        _style(c, fill_hex=DARK_GREEN, bold=True, font_color=WHITE,
+               h_align='center')
+        c.border = THIN_BOX
+
     # ── Column widths ───────────────────────────────────────────────────
     col_widths = {1: 40}
     for ci in range(2, 2 + n + n_proj):
@@ -217,7 +257,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     title_cell = ws.cell(
         row=r, column=1,
         value=f"{corp_name}  ({stock_code})"
-              f" - 재무제표 (Financial Statements)  |  단위: 억원")
+              f" - 재무제표 (Financial Statements)  |  단위: KRW")
     _style(title_cell, fill_hex=DARK_BLUE, bold=True, font_color=WHITE)
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=total_cols)
     ws.row_dimensions[r].height = 18
@@ -226,7 +266,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     # ── Subtitle row (with scenario dropdown in the last projection column) ──
     sub = ws.cell(
         row=r, column=1,
-        value="출처: DART 전자공시  |  음영 행 = 수식 자동계산  |  금액 단위: 억원 (KRW hundred millions)")
+        value="출처: DART 전자공시  |  음영 행 = 수식 자동계산  |  금액 단위: KRW (원)")
     _style(sub, fill_hex=XLIGHT_BLUE, italic=True)
     ws.merge_cells(start_row=r, start_column=1, end_row=r,
                    end_column=total_cols - 1)
@@ -256,6 +296,7 @@ def _write_financial_statements(ws, company_info, financial_data):
 
     # Column headers -- historical (DARK_BLUE) + projection (MED_BLUE)
     _write_col_headers(ws, r, list(range(2, 2 + n)), years, start_col=2)
+    _fix_ann_headers(r)
     for j, py in enumerate(proj_years):
         col = proj_start_col + j
         c = ws.cell(row=r, column=col, value=f'FY{py}E')
@@ -488,6 +529,16 @@ def _write_financial_statements(ws, company_info, financial_data):
         if i == 0:
             c = ws.cell(row=r, column=2 + i, value='N/A')
             _style(c, fill_hex=MED_GRAY, h_align='center', italic=True)
+        elif has_ann and years[i] == _ltm_info.get('ltm_year'):
+            # Q3 cumulative: 9mo vs 12mo not comparable
+            c = ws.cell(row=r, column=2 + i, value='N/A')
+            _style(c, fill_hex=MED_GRAY, h_align='center', italic=True)
+        elif has_ann and years[i] == ANN_YEAR:
+            # Annualized growth vs latest actual annual year
+            base_idx = years.index(_ltm_info['base_year'])
+            _fw(r, i,
+                f'=IF({_cl(base_idx)}{rev_row}<>0,{_cl(i)}{rev_row}/{_cl(base_idx)}{rev_row}-1,"")',
+                fmt=FMT_PCT)
         else:
             _fw(r, i,
                 f'=IF({_cl(i-1)}{rev_row}<>0,{_cl(i)}{rev_row}/{_cl(i-1)}{rev_row}-1,"")',
@@ -565,9 +616,15 @@ def _write_financial_statements(ws, company_info, financial_data):
 
     # ── Compute base-case values from historical averages for scenario table ──
     def _hist_vals(num_data, denom_data, as_growth=False):
-        """Compute historical ratios or growth rates from raw data."""
+        """Compute historical ratios or growth rates from raw data.
+        Excludes Q3 cumulative and annualized sentinel years."""
         vals = []
-        sorted_yrs = sorted(years)
+        # Use only actual full-year annual data for averages
+        _excl = set()
+        if has_ann:
+            _excl.add(_ltm_info.get('ltm_year'))
+            _excl.add(ANN_YEAR)
+        sorted_yrs = sorted(yr for yr in years if yr not in _excl)
         if as_growth:
             for idx in range(1, len(sorted_yrs)):
                 y0, y1 = sorted_yrs[idx - 1], sorted_yrs[idx]
@@ -731,6 +788,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     # =========================================================================
     _write_section_header(ws, r, '재무상태표 (BALANCE SHEET)', cols=total_cols);  r += 1
     _write_col_headers(ws, r, list(range(2, 2 + n)), years, start_col=2)
+    _fix_ann_headers(r)
     for j, py in enumerate(proj_years):
         col = proj_start_col + j
         c = ws.cell(row=r, column=col, value=f'FY{py}E')
@@ -1048,6 +1106,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     cf_cols = total_cols
     _write_section_header(ws, r, '현금흐름표 (CASH FLOW STATEMENT)', cols=cf_cols);  r += 1
     _write_col_headers(ws, r, list(range(2, 2 + n)), years, start_col=2)
+    _fix_ann_headers(r)
     for j, py in enumerate(proj_years):
         col = proj_start_col + j
         c = ws.cell(row=r, column=col, value=f'FY{py}E')
@@ -1086,6 +1145,13 @@ def _write_financial_statements(ws, company_info, financial_data):
             c = ws.cell(row=r, column=2 + i, value=0)
             _style(c, fill_hex=MED_GRAY, h_align='right', number_format=FMT_KRW,
                    italic=True)
+        elif has_ann and years[i] == ANN_YEAR:
+            # Ann WC change: base_year → Q3 BS (same as Q3 col)
+            base_idx = years.index(_ltm_info['base_year'])
+            prev = _cl(base_idx); curr = _cl(i)
+            _fw(r, i,
+                f'=({prev}{ar_row}+{prev}{inventory_row}+{prev}{other_ca_row})'
+                f'-({curr}{ar_row}+{curr}{inventory_row}+{curr}{other_ca_row})')
         else:
             prev = _cl(i - 1); curr = _cl(i)
             _fw(r, i,
@@ -1107,6 +1173,12 @@ def _write_financial_statements(ws, company_info, financial_data):
             c = ws.cell(row=r, column=2 + i, value=0)
             _style(c, fill_hex=MED_GRAY, h_align='right', number_format=FMT_KRW,
                    italic=True)
+        elif has_ann and years[i] == ANN_YEAR:
+            base_idx = years.index(_ltm_info['base_year'])
+            prev = _cl(base_idx); curr = _cl(i)
+            _fw(r, i,
+                f'=({curr}{ap_row}+{curr}{accrued_row}+{curr}{deferred_rev_row}+{curr}{other_cl_row})'
+                f'-({prev}{ap_row}+{prev}{accrued_row}+{prev}{deferred_rev_row}+{prev}{other_cl_row})')
         else:
             prev = _cl(i - 1); curr = _cl(i)
             _fw(r, i,
@@ -1318,6 +1390,7 @@ def _write_financial_statements(ws, company_info, financial_data):
         cols=cf_cols)
     r += 1
     _write_col_headers(ws, r, list(range(2, 2 + n)), years, start_col=2)
+    _fix_ann_headers(r)
     for j, py in enumerate(proj_years):
         col = proj_start_col + j
         c = ws.cell(row=r, column=col, value=f'FY{py}E')
@@ -1332,6 +1405,10 @@ def _write_financial_statements(ws, company_info, financial_data):
         if i == 0:
             c = ws.cell(row=r, column=2 + i, value='N/A (전기 없음)')
             _style(c, fill_hex=MED_GRAY, h_align='center', italic=True)
+        elif has_ann and years[i] == ANN_YEAR:
+            # Ann beginning cash = base_year cash (same as Q3 beginning)
+            base_idx = years.index(_ltm_info['base_year'])
+            _fw(r, i, f'={_cl(base_idx)}{cash_row}')
         else:
             prev = get_column_letter(2 + i - 1)
             _fw(r, i, f'={prev}{cash_row}')
@@ -1420,6 +1497,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     # =========================================================================
     _write_section_header(ws, r, '유형자산 증감표 (PP&E Schedule)', cols=total_cols); r += 1
     _write_col_headers(ws, r, list(range(2, 2 + n)), years, start_col=2)
+    _fix_ann_headers(r)
     for j, py in enumerate(proj_years):
         col = proj_start_col + j
         c = ws.cell(row=r, column=col, value=f'FY{py}E')
@@ -1452,6 +1530,10 @@ def _write_financial_statements(ws, company_info, financial_data):
         if i == 0:
             c = ws.cell(row=r, column=2 + i, value='N/A')
             _style(c, fill_hex=MED_GRAY, h_align='center', italic=True)
+        elif has_ann and years[i] == ANN_YEAR:
+            # Ann beginning = same as Q3 beginning = base_year PP&E
+            base_idx = years.index(_ltm_info['base_year'])
+            _fw(r, i, f'={_cl(base_idx)}{ppe_row}')
         else:
             _fw(r, i, f'={_cl(i-1)}{ppe_row}')
     for j in range(n_proj):
@@ -1465,7 +1547,8 @@ def _write_financial_statements(ws, company_info, financial_data):
     _lbl(r, '+ 유형자산취득 (+ Capex)')
     for i in range(n):
         _fw(r, i, f'=ABS({_cl(i)}{capex_row})')
-    last_hist_capex_val = abs(_val(cf['capex'], latest_yr) or 0)
+    _capex_ref_yr = ANN_YEAR if has_ann else latest_yr
+    last_hist_capex_val = abs(_val(cf['capex'], _capex_ref_yr) or 0)
     for j in range(n_proj):
         if j < 2:
             c = ws.cell(row=r, column=proj_start_col + j,
@@ -1541,6 +1624,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     # =========================================================================
     _write_section_header(ws, r, '이익잉여금 증감표 (Retained Earnings Schedule)', cols=total_cols); r += 1
     _write_col_headers(ws, r, list(range(2, 2 + n)), years, start_col=2)
+    _fix_ann_headers(r)
     for j, py in enumerate(proj_years):
         col = proj_start_col + j
         c = ws.cell(row=r, column=col, value=f'FY{py}E')
@@ -1561,6 +1645,9 @@ def _write_financial_statements(ws, company_info, financial_data):
         if i == 0:
             c = ws.cell(row=r, column=2 + i, value='N/A')
             _style(c, fill_hex=MED_GRAY, h_align='center', italic=True)
+        elif has_ann and years[i] == ANN_YEAR:
+            base_idx = years.index(_ltm_info['base_year'])
+            _fw(r, i, f'={_cl(base_idx)}{re_row}')
         else:
             _fw(r, i, f'={_cl(i-1)}{re_row}')
     for j in range(n_proj):
@@ -1643,18 +1730,23 @@ def _write_financial_statements(ws, company_info, financial_data):
     _latest_hist_cl = get_column_letter(2 + n - 1)
     # Find earliest year with actual revenue data for CAGR start.
     # Fall back progressively until we find a usable starting point.
-    _cagr_start_year = years[0]
+    # Use only actual annual years (exclude Q3 cum / annualized)
+    _annual_yrs = [yr for yr in years if isinstance(yr, int) and
+                   (not has_ann or yr != _ltm_info.get('ltm_year'))]
+    _cagr_start_year = _annual_yrs[0] if _annual_yrs else years[0]
     _cagr_start_rev = 0
-    for yr in years:                         # years is sorted ascending
+    for yr in (_annual_yrs or years):
         rev_val = inc['revenue'].get(yr)
         if rev_val and rev_val > 0:
             _cagr_start_year = yr
             _cagr_start_rev = rev_val
             break
-    # Periods = gap between start year and latest historical year
-    _cagr_periods = years[-1] - _cagr_start_year
+    # Periods = gap between start year and latest int year
+    _cagr_periods = latest_yr - _cagr_start_year
     if _cagr_periods < 1:
         _cagr_periods = 1
+    _cagr_end_label = (_ltm_info['ann_label'] if has_ann
+                       else f'FY{latest_yr}')
 
     r += 2
     _write_section_header(ws, r, '매출액 CAGR (Revenue CAGR)', cols=total_cols); r += 1
@@ -1666,7 +1758,7 @@ def _write_financial_statements(ws, company_info, financial_data):
     c.border = THIN_BOX
     cagr_start_row = r; r += 1
 
-    _lbl(r, f'기말 매출액 (Ending Revenue, FY{years[-1]})')
+    _lbl(r, f'기말 매출액 (Ending Revenue, {_cagr_end_label})')
     c = ws.cell(row=r, column=2, value=f'={_latest_hist_cl}{rev_row}')
     _style(c, fill_hex=LIGHT_GREEN, bold=False, h_align='right',
            number_format=FMT_KRW)
@@ -2140,7 +2232,7 @@ def _write_dcf_model(ws, company_info, financial_data, fs_rows, wacc_rows):
     # Title
     title = ws.cell(row=r, column=1,
                     value=f"{corp_name} ({stock_code})"
-                          f" - 할인현금흐름 모형 (DCF Model)  |  단위: 억원")
+                          f" - 할인현금흐름 모형 (DCF Model)  |  단위: KRW")
     _style(title, fill_hex=DARK_BLUE, bold=True, font_color=WHITE)
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=8)
     r += 2
