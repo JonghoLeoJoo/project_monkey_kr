@@ -18,9 +18,22 @@ import re
 import sys
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+_YF_TIMEOUT = 10  # seconds — timeout for yfinance calls
+
+
+def _yf_with_timeout(fn, timeout=_YF_TIMEOUT, default=None):
+    """Run *fn* in a thread with a timeout. Returns *default* on timeout."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(fn)
+        try:
+            return fut.result(timeout=timeout)
+        except (FuturesTimeout, Exception):
+            return default
 
 
 @contextmanager
@@ -157,22 +170,27 @@ def _detect_market(stock_code: str) -> str:
 # The first match wins, similar to XBRL concept fallback chains.
 
 IS_MAP: Dict[str, List[str]] = {
-    'revenue':          ['매출액', '영업수익', '수익(매출액)', '매출', '이자수익'],
+    'revenue':          ['매출액', '영업수익', '수익(매출액)', '매출', '이자수익',
+                         '매출액및지분법손익', '매출및지분법손익',
+                         '보험서비스수익'],
     'cogs':             ['매출원가'],
     'gross_profit':     ['매출총이익'],
     'sga_expense':      ['판매비와관리비', '판매비와 관리비'],
     'rd_expense':       ['연구개발비', '경상연구개발비', '연구비'],
-    'operating_income': ['영업이익', '영업이익(손실)'],
+    'operating_income': ['영업이익', '영업이익(손실)', '영업손실'],
     'interest_expense': ['금융비용', '이자비용', '금융원가'],
     'interest_income':  ['금융수익', '이자수익'],
     'other_income':     ['기타수익', '기타이익'],
     'other_expense':    ['기타비용', '기타손실'],
     'pretax_income':    ['법인세비용차감전순이익', '법인세비용차감전순이익(손실)',
-                         '법인세비용차감전순이익(손실)', '법인세차감전순이익'],
+                         '법인세비용차감전순이익(손실)', '법인세차감전순이익',
+                         '법인세차감전순손실'],
     'tax_expense':      ['법인세비용', '법인세비용(수익)'],
-    'net_income':       ['당기순이익', '당기순이익(손실)', '지배기업 소유지분',
-                         '지배기업소유주지분'],
-    'net_income_total': ['당기순이익', '당기순이익(손실)'],
+    'net_income':       ['당기순이익', '당기순이익(손실)', '연결당기순이익',
+                         '연결당기순이익(손실)', '당기순손실',
+                         '지배기업 소유지분', '지배기업소유주지분'],
+    'net_income_total': ['당기순이익', '당기순이익(손실)', '연결당기순이익',
+                         '연결당기순이익(손실)', '당기순손실'],
     'minority_interest': ['비지배지분', '비지배주주지분'],
     'eps_basic':        ['기본주당이익', '기본주당순이익', '기본주당이익(손실)'],
     'eps_diluted':      ['희석주당이익', '희석주당순이익', '희석주당이익(손실)'],
@@ -185,7 +203,8 @@ BS_MAP: Dict[str, List[str]] = {
     'cash':             ['현금및현금성자산'],
     'st_investments':   ['단기금융상품', '단기상각후원가금융자산',
                          '단기당기손익-공정가치금융자산'],
-    'accounts_rec':     ['매출채권', '매출채권 및 기타유동채권'],
+    'accounts_rec':     ['매출채권', '매출채권 및 기타유동채권',
+                         '매출채권및기타채권', '매출채권및기타유동채권'],
     'inventory':        ['재고자산'],
     'other_current_a':  ['기타유동자산'],
     'total_noncurrent_a': ['비유동자산'],
@@ -200,7 +219,8 @@ BS_MAP: Dict[str, List[str]] = {
 
     'total_liabilities': ['부채총계'],
     'total_current_l':  ['유동부채'],
-    'accounts_pay':     ['매입채무', '매입채무 및 기타유동채무'],
+    'accounts_pay':     ['매입채무', '매입채무 및 기타유동채무',
+                         '매입채무및기타채무', '매입채무및기타유동채무'],
     'st_debt':          ['단기차입금'],
     'current_lt_debt':  ['유동성장기부채'],
     'accrued_liab':     ['미지급비용', '미지급금'],
@@ -225,7 +245,8 @@ CF_MAP: Dict[str, List[str]] = {
     'operating_cf':     ['영업활동현금흐름', '영업활동으로인한현금흐름',
                          '영업활동으로 인한 현금흐름'],
     'cf_from_ops':      ['영업에서 창출된 현금흐름', '영업에서 창출된 현금'],
-    'net_income_cf':    ['당기순이익'],
+    'net_income_cf':    ['당기순이익', '연결당기순이익', '연결당기순이익(손실)',
+                         '당기순이익(손실)', '당기순손실'],
     'adjustments':      ['조정'],
     'cf_depreciation':  ['감가상각비'],
     'cf_amortization':  ['무형자산상각비', '무형자산 상각비'],
@@ -248,7 +269,9 @@ CF_MAP: Dict[str, List[str]] = {
     'debt_issuance':    ['장기차입금의 차입', '단기차입금의 순증가(감소)'],
     'debt_repay':       ['사채 및 장기차입금의 상환'],
     'fx_effect':        ['외화환산으로 인한 현금의 변동',
-                         '현금및현금성자산의 환율변동효과'],
+                         '현금및현금성자산의 환율변동효과',
+                         '현금및현금성자산에 대한 환율변동효과',
+                         '현금 및 현금성자산의 환율변동효과'],
     'net_cash_change':  ['현금및현금성자산의 증가(감소)', '현금및현금성자산의 증가'],
     'beginning_cash':   ['기초현금및현금성자산', '기초의 현금및현금성자산'],
     'ending_cash':      ['기말현금및현금성자산', '기말의 현금및현금성자산'],
@@ -326,7 +349,9 @@ def _extract_from_df(df, account_names: List[str],
 
     def _normalise(s: str) -> str:
         """Strip Roman numeral / numeric prefixes and collapse spaces."""
-        s = re.sub(r'^[ⅠⅡⅢⅣⅤⅥⅦ0-9]+\.\s*', '', s)
+        # Unicode Roman numerals (Ⅰ-Ⅻ) and Latin (I, II, ..., XII, etc.)
+        s = re.sub(r'^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ0-9]+\.\s*', '', s)
+        s = re.sub(r'^[IVXivx]+\.\s*', '', s)
         return s.replace(' ', '')
 
     for div in divs_to_try:
@@ -524,20 +549,18 @@ def extract_financial_data(corp_code: str, years: List[int],
         cf_depr = cf_data.get('cf_depreciation', {}).get(yr)
         cf_amort = cf_data.get('cf_amortization', {}).get(yr)
         cf_rou = cf_data.get('cf_rou_depr', {}).get(yr)
-        # Combine all available D&A components
-        da_components = [v for v in [cf_depr, cf_rou] if v is not None]
+        # D&A = 감가상각비 + 사용권자산상각비 + 무형자산상각비
+        da_components = [v for v in [cf_depr, cf_rou, cf_amort] if v is not None]
         da_val = sum(abs(v) for v in da_components) if da_components else None
         da_data[yr] = da_val
-        amort_val = abs(cf_amort) if cf_amort is not None else None
-        amort_data[yr] = amort_val
+        amort_data[yr] = None  # kept for backward compat but folded into da
 
     ebitda: Dict[int, Optional[float]] = {}
     for yr in years:
         oi = is_data['operating_income'].get(yr)
         da = da_data.get(yr) or 0
-        am = amort_data.get(yr) or 0
         if oi is not None:
-            ebitda[yr] = oi + abs(da) + abs(am)
+            ebitda[yr] = oi + abs(da)
         else:
             ebitda[yr] = None
 
@@ -574,6 +597,7 @@ def extract_financial_data(corp_code: str, years: List[int],
 
     # Build the financial_data dict matching project_monkey structure
     financial_data: Dict = {
+        '_corp_code': corp_code,
         'years': years,
         'income_statement': {
             'revenue':          is_data['revenue'],
@@ -629,7 +653,9 @@ def extract_financial_data(corp_code: str, years: List[int],
             'total_equity':     bs_data['total_equity'],
         },
         'cash_flow': {
-            'net_income':   cf_data.get('net_income_cf', is_data['net_income']),
+            'net_income':   (cf_data.get('net_income_cf')
+                             if any(v is not None for v in cf_data.get('net_income_cf', {}).values())
+                             else is_data['net_income']),
             'da':           da_data,
             'sbc':          sbc,
             'operating_cf': cf_data['operating_cf'],
@@ -656,6 +682,126 @@ def extract_financial_data(corp_code: str, years: List[int],
     return financial_data
 
 
+def _extract_da_from_footnotes(corp_code: str, year: int) -> Optional[Dict]:
+    """Extract D&A from annual report footnotes (CF adjustment section).
+
+    Parses the HTML footnotes to find the CF adjustment breakdown which
+    typically lists 감가상각비, 사용권자산상각비, 무형자산상각비 separately.
+
+    Returns dict with keys: 'da' (PPE depr), 'rou_da' (ROU depr),
+    'amort' (intangible amort) — all in raw KRW (footnote 천원 × 1000).
+    Returns None if parsing fails.
+    """
+    dart = _get_dart()
+    try:
+        # Find the annual report (사업보고서)
+        # The report for fiscal year Y is typically filed in year Y+1
+        reports = dart.list(corp_code, start=f'{year + 1}-01-01',
+                           end=f'{year + 1}-12-31', kind='A')
+        if reports is None or reports.empty:
+            # Try year Y in case of early filers
+            reports = dart.list(corp_code, start=f'{year}-01-01',
+                               end=f'{year}-12-31', kind='A')
+        if reports is None or reports.empty:
+            return None
+
+        # Find 사업보고서 (annual report)
+        annual = reports[reports['report_nm'].str.contains('사업보고서', na=False)]
+        if annual.empty:
+            return None
+        rcp_no = annual.iloc[0]['rcept_no']
+
+        # Get sub-documents and find footnotes
+        sd = dart.sub_docs(rcp_no)
+        if sd is None or sd.empty:
+            return None
+
+        # Look for consolidated footnotes first, then individual
+        note_url = None
+        for pattern in ['연결재무제표 주석', '재무제표 주석']:
+            matches = sd[sd['title'].str.contains(pattern, na=False)]
+            if not matches.empty:
+                note_url = matches.iloc[0]['url']
+                break
+        if not note_url:
+            return None
+
+        # Fetch the footnote HTML
+        resp = requests.get(note_url, timeout=15)
+        resp.encoding = 'utf-8'
+        html = resp.text
+
+        # Strip HTML tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        text = re.sub(r'&nbsp;', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+
+        result = {}
+
+        # Parse CF adjustment section: look for "영업에서 창출된 현금" section
+        # Pattern: 감가상각비 <당기값> <전기값>
+        # The section typically has: 감가상각비 NNN,NNN NNN,NNN
+        cf_section = re.search(
+            r'영업에서\s*창출된\s*현금.{0,2000}?(?=\d+\.\s|$)',
+            text, re.DOTALL)
+        if not cf_section:
+            # Try alternative pattern
+            cf_section = re.search(
+                r'현금흐름표.{0,500}당기순이익.{0,3000}',
+                text, re.DOTALL)
+        if not cf_section:
+            return None
+
+        cf_text = cf_section.group(0)
+
+        # Helper to parse a number (handles Korean number format with commas)
+        def _parse_num(s):
+            s = s.strip().replace(',', '').replace('(', '-').replace(')', '')
+            try:
+                return int(s)
+            except (ValueError, TypeError):
+                return None
+
+        # Extract depreciation items from CF adjustment section
+        # Pattern: "감가상각비 <number> <number>" where numbers may have commas
+        num_pat = r'[\d,]+(?:\.\d+)?'
+        # 감가상각비 (PPE depreciation)
+        m = re.search(rf'감가상각비\s+({num_pat})\s+({num_pat})', cf_text)
+        if m:
+            result['da'] = _parse_num(m.group(1))       # 당기
+            result['da_prior'] = _parse_num(m.group(2))  # 전기
+
+        # 사용권자산상각비 (ROU depreciation)
+        m = re.search(rf'사용권자산상각비\s+({num_pat})\s+({num_pat})', cf_text)
+        if not m:
+            m = re.search(rf'사용권자산의?\s*감가상각비\s+({num_pat})\s+({num_pat})',
+                          cf_text)
+        if m:
+            result['rou_da'] = _parse_num(m.group(1))
+            result['rou_da_prior'] = _parse_num(m.group(2))
+
+        # 무형자산상각비 (intangible amortization)
+        m = re.search(rf'무형(?:고정)?자산상각\s+({num_pat})\s+({num_pat})', cf_text)
+        if not m:
+            m = re.search(rf'무형자산상각비\s+({num_pat})\s+({num_pat})', cf_text)
+        if m:
+            result['amort'] = _parse_num(m.group(1))
+            result['amort_prior'] = _parse_num(m.group(2))
+
+        if not result:
+            return None
+
+        # Convert from 천원 (thousands) to raw KRW
+        for k in list(result.keys()):
+            if result[k] is not None:
+                result[k] = result[k] * 1000
+
+        return result
+
+    except Exception:
+        return None
+
+
 def _infer_asset_depr(asset_begin, asset_end, acquisitions_yr):
     """Infer depreciation/amortization from asset schedule:
     Depr = Asset_begin + |Acquisitions| - Asset_end
@@ -671,11 +817,11 @@ def _infer_asset_depr(asset_begin, asset_end, acquisitions_yr):
 def _fill_da_from_cf(fd: Dict, years: List[int]) -> None:
     """Fill D&A and amortization when not directly available from CF.
 
-    Uses asset schedule inference:
-      PPE depreciation = PPE_begin + |Capex| - PPE_end
-      Intangible amort = Intangibles_begin + |Intangible_acq| - Intangibles_end
-
-    Fallback: use capex * 0.7 as a rough D&A proxy.
+    Priority:
+      1) CF-extracted 감가상각비 (already populated if available)
+      2) Annual report footnote parsing (CF adjustment breakdown)
+      3) PPE schedule inference: PPE_begin + |Capex| - PPE_end
+      4) Rough fallback: capex * 0.7
     """
     da = fd['income_statement']['da']
     am = fd['income_statement']['amortization']
@@ -686,10 +832,40 @@ def _fill_da_from_cf(fd: Dict, years: List[int]) -> None:
 
     sorted_years = sorted(years)
 
+    # Try footnote parsing for years missing D&A
+    missing_da_years = [yr for yr in years if da.get(yr) is None]
+    if missing_da_years:
+        corp_code = fd.get('_corp_code', '')
+        if corp_code:
+            # Footnotes contain 당기 (current) and 전기 (prior) values.
+            # Try the latest annual report first — it covers 2 years.
+            _tried_years = set()
+            for yr in sorted(missing_da_years, reverse=True):
+                if yr in _tried_years:
+                    continue
+                fn = _extract_da_from_footnotes(corp_code, yr)
+                if fn:
+                    # Apply 당기 values to yr
+                    # D&A = 감가상각비 + 사용권자산상각비 + 무형자산상각비
+                    if da.get(yr) is None:
+                        parts = [fn.get('da'), fn.get('rou_da'), fn.get('amort')]
+                        known = [v for v in parts if v is not None]
+                        if known:
+                            da[yr] = sum(known)
+                    _tried_years.add(yr)
+                    # Apply 전기 values to yr-1 if available
+                    prior_yr = yr - 1
+                    if prior_yr in years and da.get(prior_yr) is None:
+                        parts_p = [fn.get('da_prior'), fn.get('rou_da_prior'), fn.get('amort_prior')]
+                        known_p = [v for v in parts_p if v is not None]
+                        if known_p:
+                            da[prior_yr] = sum(known_p)
+                        _tried_years.add(prior_yr)
+
+    # Fall back to PPE schedule inference for remaining missing years
     for yr in years:
         if da.get(yr) is not None:
             continue
-        # Infer PPE depreciation from asset schedule
         idx = sorted_years.index(yr) if yr in sorted_years else -1
         if idx > 0:
             prior_yr = sorted_years[idx - 1]
@@ -722,8 +898,7 @@ def _fill_da_from_cf(fd: Dict, years: List[int]) -> None:
     for yr in years:
         if oi.get(yr) is not None:
             d = abs(da.get(yr) or 0)
-            a = abs(am.get(yr) or 0)
-            ebitda[yr] = oi[yr] + d + a
+            ebitda[yr] = oi[yr] + d
 
 
 def _get_shares(stock_code: str, years: List[int]) -> Dict[int, Optional[float]]:
@@ -864,51 +1039,88 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
         except Exception:
             return None
 
-    # Quarter configs: (reprt_code, label, n_quarters, component_codes)
-    # component_codes = individual quarter report codes needed if standalone
+    # Quarter configs: (reprt_code, label, n_quarters)
+    # DART report codes: 11013=Q1, 11012=H1(반기), 11014=Q3, 11011=Annual
+    # Note: 11012 (반기) is cumulative H1 (Q1+Q2), not standalone Q2.
+    # For standalone summation:
+    #   Q3 cumulative = H1(11012) + Q3(11014)   [H1 is already Q1+Q2]
+    #   H1 cumulative = use H1(11012) directly  [already Q1+Q2]
     QUARTER_CONFIGS = [
-        ('11014', 'Q3', 3, ['11013', '11012', '11014']),  # Q1 + Q2 + Q3
-        ('11012', 'H1', 2, ['11013', '11012']),            # Q1 + Q2
-        ('11013', 'Q1', 1, ['11013']),                     # Q1 only
+        ('11014', 'Q3', 3),
+        ('11012', 'H1', 2),
+        ('11013', 'Q1', 1),
     ]
 
-    for reprt_code, label, n_quarters, component_codes in QUARTER_CONFIGS:
+    for reprt_code, label, n_quarters in QUARTER_CONFIGS:
         q_latest = _fetch(next_year, reprt_code)
         if q_latest is None:
             continue
 
-        # ── Detect standalone vs cumulative ──────────────────────────────
-        # Compare latest quarter's revenue to annual revenue.
-        # If Q_rev < FY_rev * 0.5 → standalone (one quarter ≈ 25% of FY)
-        # If Q_rev > FY_rev * 0.5 → cumulative (multiple quarters ≈ 75%)
-        fy_rev = financial_data['income_statement'].get('revenue', {}).get(latest_annual_year)
-        q_rev = _extract_from_df(q_latest, IS_MAP['revenue'],
-                                 col='thstrm_amount', sj_div='IS')
-        is_standalone = (q_rev is not None and fy_rev is not None
-                         and fy_rev > 0 and q_rev < fy_rev * 0.5)
+        # ── Detect cumulative column availability ──────────────────────────
+        # DART quarterly reports have two IS/CF amount columns:
+        #   thstrm_amount     — standalone quarter (e.g. Q3 only)
+        #   thstrm_add_amount — YTD cumulative (e.g. Q1+Q2+Q3)
+        # When thstrm_add_amount is populated, use it directly as cumulative.
+        # Fall back to the old H1+Q3 summation logic only when it's absent.
+        add_rev = _extract_from_df(q_latest, IS_MAP['revenue'],
+                                   col='thstrm_add_amount', sj_div='IS')
+        has_add_amount = add_rev is not None and n_quarters > 1
 
-        if is_standalone and n_quarters > 1:
-            print(f"  Quarterly data is standalone - summing Q1"
-                  f"{'..Q' + str(n_quarters) if n_quarters > 1 else ''}"
-                  f" {next_year} for cumulative...")
-            # Fetch all component quarters for current and prior year
-            cur_dfs = [_fetch(next_year, rc) for rc in component_codes]
-            cur_dfs = [df for df in cur_dfs if df is not None]
-            pri_dfs = [_fetch(latest_annual_year, rc) for rc in component_codes]
-            pri_dfs = [df for df in pri_dfs if df is not None]
+        # For prior year, prefer frmtrm_add_amount from the SAME report
+        q_prior = _fetch(latest_annual_year, reprt_code)
 
-            if not cur_dfs:
+        # CF items in DART quarterly reports are typically YTD cumulative
+        # in thstrm_amount itself, so keep using that column for CF.
+        cf_cur_dfs = [q_latest]
+        cf_pri_dfs = [q_prior] if q_prior is not None else []
+
+        if has_add_amount:
+            # thstrm_add_amount is the DART-provided cumulative — use directly
+            print(f"  Quarterly data is standalone - using {label}"
+                  f" {next_year} thstrm_add_amount for IS cumulative...")
+            # cur_dfs / pri_dfs only matter for IS fallback; set them but
+            # the IS loop below will prefer add_amount columns.
+            use_add_col = True
+            cur_dfs = [q_latest]
+            pri_dfs = [q_prior] if q_prior is not None else []
+            if not pri_dfs:
                 continue
         else:
-            if is_standalone:
-                print(f"  Using {label} {next_year} data (standalone = cumulative for Q1)...")
+            use_add_col = False
+            # Legacy detection: compare thstrm_amount to FY to decide
+            fy_rev = financial_data['income_statement'].get('revenue', {}).get(latest_annual_year)
+            q_rev = _extract_from_df(q_latest, IS_MAP['revenue'],
+                                     col='thstrm_amount', sj_div='IS')
+            is_standalone = (q_rev is not None and fy_rev is not None
+                             and fy_rev > 0 and q_rev < fy_rev * 0.5)
+
+            if is_standalone and n_quarters > 1:
+                if label == 'Q3':
+                    print(f"  Quarterly data is standalone - using H1+Q3"
+                          f" {next_year} for IS cumulative...")
+                    h1_cur = _fetch(next_year, '11012')
+                    cur_dfs = [df for df in [h1_cur, q_latest] if df is not None]
+                    h1_pri = _fetch(latest_annual_year, '11012')
+                    q3_pri = _fetch(latest_annual_year, '11014')
+                    pri_dfs = [df for df in [h1_pri, q3_pri] if df is not None]
+                else:
+                    print(f"  Using {label} {next_year} data"
+                          f" (standalone quarter, H1 report is cumulative)...")
+                    cur_dfs = [q_latest]
+                    if q_prior is None:
+                        continue
+                    pri_dfs = [q_prior]
+                if not cur_dfs:
+                    continue
             else:
-                print(f"  Using {label} {next_year} data (cumulative)...")
-            cur_dfs = [q_latest]
-            q_prior = _fetch(latest_annual_year, reprt_code)
-            if q_prior is None:
-                continue
-            pri_dfs = [q_prior]
+                if is_standalone:
+                    print(f"  Using {label} {next_year} data (standalone = cumulative for Q1)...")
+                else:
+                    print(f"  Using {label} {next_year} data (cumulative)...")
+                cur_dfs = [q_latest]
+                if q_prior is None:
+                    continue
+                pri_dfs = [q_prior]
 
         # The latest quarter's report is always used for BS (point-in-time)
         bs_df = q_latest
@@ -934,8 +1146,21 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
             if fd_key not in financial_data['income_statement']:
                 continue
             annual_val = financial_data['income_statement'][fd_key].get(latest_annual_year)
-            q_cur_val = _sum_from_dfs(cur_dfs, names, sj_div='IS')
-            q_pri_val = _sum_from_dfs(pri_dfs, names, sj_div='IS')
+
+            if use_add_col:
+                # Use DART-provided cumulative columns directly
+                q_cur_val = _extract_from_df(q_latest, names,
+                                             col='thstrm_add_amount', sj_div='IS')
+                # Prior year cumulative from the CURRENT report's frmtrm_add_amount
+                q_pri_val = _extract_from_df(q_latest, names,
+                                             col='frmtrm_add_amount', sj_div='IS')
+                # Fallback: try prior year's report thstrm_add_amount
+                if q_pri_val is None and pri_dfs:
+                    q_pri_val = _extract_from_df(pri_dfs[0], names,
+                                                 col='thstrm_add_amount', sj_div='IS')
+            else:
+                q_cur_val = _sum_from_dfs(cur_dfs, names, sj_div='IS')
+                q_pri_val = _sum_from_dfs(pri_dfs, names, sj_div='IS')
 
             # Q cumulative → stored under ltm_year in normal data dicts
             financial_data['income_statement'][fd_key][ltm_year] = q_cur_val
@@ -946,14 +1171,15 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
             else:
                 ann_is[fd_key] = None
 
-        # CF metrics
+        # CF metrics — use cf_cur_dfs/cf_pri_dfs (latest report only,
+        # since DART quarterly CF is typically YTD cumulative)
         for key, names in CF_MAP.items():
             fd_key = key
             if fd_key not in financial_data['cash_flow']:
                 continue
             annual_val = financial_data['cash_flow'][fd_key].get(latest_annual_year)
-            q_cur_val = _sum_from_dfs(cur_dfs, names, sj_div='CF')
-            q_pri_val = _sum_from_dfs(pri_dfs, names, sj_div='CF')
+            q_cur_val = _sum_from_dfs(cf_cur_dfs, names, sj_div='CF')
+            q_pri_val = _sum_from_dfs(cf_pri_dfs, names, sj_div='CF')
 
             financial_data['cash_flow'][fd_key][ltm_year] = q_cur_val
 
@@ -964,14 +1190,14 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
 
         # Capex fallback: sum individual PPE items
         if financial_data['cash_flow'].get('capex', {}).get(ltm_year) is None:
-            q_cur_capex = _sum_ppe_from_dfs(cur_dfs)
+            q_cur_capex = _sum_ppe_from_dfs(cf_cur_dfs)
             financial_data['cash_flow']['capex'][ltm_year] = q_cur_capex
 
         if 'capex' not in ann_cf or ann_cf.get('capex') is None:
             annual_capex = financial_data['cash_flow'].get('capex', {}).get(latest_annual_year)
             q_cur_capex = (financial_data['cash_flow']['capex'].get(ltm_year)
-                           or _sum_ppe_from_dfs(cur_dfs))
-            q_pri_capex = _sum_ppe_from_dfs(pri_dfs)
+                           or _sum_ppe_from_dfs(cf_cur_dfs))
+            q_pri_capex = _sum_ppe_from_dfs(cf_pri_dfs)
             if annual_capex is not None and q_cur_capex is not None and q_pri_capex is not None:
                 ann_cf['capex'] = annual_capex + q_cur_capex - q_pri_capex
 
@@ -985,6 +1211,13 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
 
         # Recompute derived metrics for Q cumulative year
         _fill_da_from_cf(financial_data, financial_data['years'])
+        # If Q cumulative D&A still missing, prorate annual D&A
+        da_dict = financial_data['income_statement'].get('da', {})
+        am_dict = financial_data['income_statement'].get('amortization', {})
+        if da_dict.get(ltm_year) is None and da_dict.get(latest_annual_year) is not None:
+            da_dict[ltm_year] = da_dict[latest_annual_year] * n_quarters / 4
+        if am_dict.get(ltm_year) is None and am_dict.get(latest_annual_year) is not None:
+            am_dict[ltm_year] = am_dict[latest_annual_year] * n_quarters / 4
         _recompute_derived(financial_data, ltm_year)
 
         # Build annualized derived metrics
@@ -994,10 +1227,13 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
         ann_cf_amort = ann_cf.get('cf_amortization')
         ann_oi = ann_is.get('operating_income')
 
-        # Combine D&A from CF components if available
-        da_parts = [v for v in [ann_cf_depr, ann_cf_rou] if v is not None]
+        # Combine D&A from CF components if available (depr + ROU + amort)
+        da_parts = [v for v in [ann_cf_depr, ann_cf_rou, ann_cf_amort] if v is not None]
         ann_da = sum(abs(v) for v in da_parts) if da_parts else None
-        ann_amort = abs(ann_cf_amort) if ann_cf_amort is not None else None
+
+        if ann_da is None:
+            # Fallback: use annual D&A (from footnotes — already includes amort)
+            ann_da = financial_data['income_statement'].get('da', {}).get(latest_annual_year)
 
         if ann_da is None and ann_oi is not None:
             # Derive D&A from PPE schedule for annualized period
@@ -1009,20 +1245,11 @@ def compute_ltm(corp_code: str, latest_annual_year: int,
             if ann_da is None and ann_capex:
                 ann_da = abs(ann_capex) * 0.7
 
-        if ann_amort is None:
-            # Infer intangible amortization from intangibles schedule
-            intang_begin = financial_data['balance_sheet'].get('intangibles', {}).get(latest_annual_year)
-            intang_end = ann_bs.get('intangibles')
-            ann_intang_acq = ann_cf.get('intangible_acq')
-            if intang_begin is not None and intang_end is not None and ann_intang_acq is not None:
-                ann_amort = _infer_asset_depr(intang_begin, intang_end, ann_intang_acq)
-
         ann_is['da'] = ann_da
-        ann_is['amortization'] = ann_amort
 
         # Annualized EBITDA
         if ann_oi is not None:
-            ann_is['ebitda'] = ann_oi + (ann_da or 0) + (ann_is.get('amortization') or 0)
+            ann_is['ebitda'] = ann_oi + (ann_da or 0)
         else:
             ann_is['ebitda'] = None
 
@@ -1075,12 +1302,11 @@ def _recompute_derived(fd: Dict, yr: int) -> None:
     if gp is None and rev and cogs:
         inc['gross_profit'][yr] = rev - cogs
 
-    # EBITDA
+    # EBITDA = OI + D&A (D&A already includes amortization)
     oi = inc['operating_income'].get(yr)
     da = inc['da'].get(yr) or 0
-    am = inc['amortization'].get(yr) or 0
     if oi is not None:
-        inc['ebitda'][yr] = oi + abs(da) + abs(am)
+        inc['ebitda'][yr] = oi + abs(da)
 
     # FCF
     opcf = cf['operating_cf'].get(yr)
@@ -1166,17 +1392,17 @@ def get_kr_bond_yield() -> float:
     # Try yfinance for Korean 10Y bond (symbol varies)
     if _HAS_YFINANCE:
         for sym in ['^KS10Y', '148070.KS']:  # Korea 10Y ETFs/indices
-            try:
+            def _get_yield(s=sym):
                 with _suppress_stdout():
-                    t = yf.Ticker(sym)
+                    t = yf.Ticker(s)
                     hist = t.history(period='5d')
                 if hist is not None and not hist.empty:
-                    val = float(hist['Close'].iloc[-1])
-                    if 0 < val < 20:
-                        print(f"  Korean 10Y bond yield (yfinance {sym}): {val:.2f}%")
-                        return val / 100.0
-            except Exception:
-                pass
+                    return float(hist['Close'].iloc[-1])
+                return None
+            val = _yf_with_timeout(_get_yield)
+            if val and 0 < val < 20:
+                print(f"  Korean 10Y bond yield (yfinance {sym}): {val:.2f}%")
+                return val / 100.0
 
     # Default
     print("  Using default Korean 10Y bond yield: 3.50%")
@@ -1341,6 +1567,20 @@ def get_industry_peers(stock_code: str,
             '65': ['보험', '생명', '화재'],
             '10': ['식품', '음식', '제과', '음료'],
             '14': ['의류', '패션', '화장품'],
+            '24': ['철강', '금속', '제철', '포스코'],
+            '25': ['비금속', '광물', '시멘트', '유리'],
+            '29': ['기계', '장비', '두산'],
+            '31': ['조선', '해양', '중공업'],
+            '35': ['전력', '에너지', '발전'],
+            '41': ['건설', '건축', '시공'],
+            '46': ['도매', '무역', '상사'],
+            '47': ['소매', '유통', '백화점', '마트'],
+            '49': ['운수', '항공', '해운', '물류'],
+            '51': ['통신', '텔레콤'],
+            '58': ['출판', '미디어', '콘텐츠', '엔터'],
+            '61': ['정보통신', '데이터', 'ICT'],
+            '70': ['지주', '홀딩스'],
+            '71': ['연구', 'R&D', '기술'],
         }
         # Try longer prefixes first for specificity (e.g. '204' before '20')
         keywords = []
@@ -1352,7 +1592,19 @@ def get_industry_peers(stock_code: str,
                     break
         if not keywords:
             # Fall back to generic search using company name fragments
-            keywords = [corp_name[:2]]  # first two chars of company name
+            # Extract Korean characters from corp_name for keyword search
+            import re as _re
+            _korean = _re.findall(r'[\uac00-\ud7af]+', corp_name)
+            if _korean:
+                # Use first Korean word (at least 2 chars) as keyword
+                kw = next((w for w in _korean if len(w) >= 2), _korean[0])
+                keywords = [kw[:2]]
+            else:
+                # Purely non-Korean name — use industry_name fragments
+                if industry_name:
+                    keywords = [industry_name[:2]]
+                else:
+                    keywords = [corp_name[:2]]
         industry_keyword = ','.join(keywords)
 
     # Step 3: Search for matching companies
@@ -1429,14 +1681,13 @@ def _get_peer_data(stock_code: str, corp_code: str = '',
     beta = 1.0
     if _HAS_YFINANCE:
         for suffix in ['.KS', '.KQ']:
-            try:
-                yf_t = yf.Ticker(f'{stock_code}{suffix}')
-                b = yf_t.info.get('beta')
-                if b and 0.1 < b < 5.0:
-                    beta = b
-                    break
-            except Exception:
-                pass
+            def _get_beta(s=suffix):
+                t = yf.Ticker(f'{stock_code}{s}')
+                return t.info.get('beta')
+            b = _yf_with_timeout(_get_beta)
+            if b and 0.1 < b < 5.0:
+                beta = b
+                break
 
     # Financial data from DART (latest annual report)
     # Use finstate_all for granular items (finstate only has summaries)
@@ -1566,11 +1817,10 @@ def get_pe_comps_data(peers: List[Dict],
         # Forward EPS from yfinance
         forward_eps = None
         if _HAS_YFINANCE:
-            try:
-                yf_t = yf.Ticker(f'{code}.KS')
-                forward_eps = yf_t.info.get('forwardEps')
-            except Exception:
-                pass
+            def _get_fwd_eps(c=code):
+                t = yf.Ticker(f'{c}.KS')
+                return t.info.get('forwardEps')
+            forward_eps = _yf_with_timeout(_get_fwd_eps)
 
         # Compute P/E ratios
         trailing_pe = None

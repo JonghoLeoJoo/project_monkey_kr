@@ -181,16 +181,22 @@ def build_model(company_query: str, skip_prices: bool = False,
             diluted_sh = inc['shares_diluted'].get(yr) or b
             break
 
-    # Implied cost of debt: interest expense / total debt
+    # Implied cost of debt: interest expense / average total debt
+    # Uses average of current and prior period debt outstanding.
     # Korean IFRS 이자비용 often includes lease interest and other items,
     # so cap at 12% to avoid unreasonable values.
+    def _total_debt(yr):
+        return ((bs.get('st_debt', {}).get(yr) or 0)
+                + (bs.get('lt_debt', {}).get(yr) or 0)
+                + (bs.get('current_lt_debt', {}).get(yr) or 0))
+
     int_exp = abs(inc['interest_expense'].get(latest) or 0)
-    st_debt = bs.get('st_debt', {}).get(latest) or 0
-    lt_debt = bs.get('lt_debt', {}).get(latest) or 0
-    cur_lt_debt = bs.get('current_lt_debt', {}).get(latest) or 0
-    total_debt_raw = st_debt + lt_debt + cur_lt_debt
-    if total_debt_raw > 0:
-        raw_cod = int_exp / total_debt_raw
+    debt_cur = _total_debt(latest)
+    prior = years[1] if len(years) > 1 else None
+    debt_pri = _total_debt(prior) if prior else 0
+    avg_debt = (debt_cur + debt_pri) / 2 if (debt_cur + debt_pri) > 0 else 0
+    if avg_debt > 0:
+        raw_cod = int_exp / avg_debt
         implied_cod = round(min(raw_cod, 0.12), 4)  # Cap at 12%
     else:
         implied_cod = 0.05  # Default 5%
@@ -262,7 +268,7 @@ def bulk_test():
         print(f"{'-' * 70}")
 
         try:
-            result = build_model(code, skip_prices=True, auto_select=True)
+            result = build_model(code, skip_prices=False, auto_select=True)
             if result is None:
                 results.append({
                     'code': code, 'status': 'SKIP',
@@ -467,14 +473,19 @@ def main():
             diluted_sh = inc['shares_diluted'].get(yr) or b
             break
 
-    # Implied cost of debt (cap at 12% -- Korean IFRS interest includes leases)
+    # Implied cost of debt: interest expense / average total debt
+    def _total_debt(yr):
+        return ((bs.get('st_debt', {}).get(yr) or 0)
+                + (bs.get('lt_debt', {}).get(yr) or 0)
+                + (bs.get('current_lt_debt', {}).get(yr) or 0))
+
     int_exp = abs(inc['interest_expense'].get(latest) or 0)
-    st_debt = bs.get('st_debt', {}).get(latest) or 0
-    lt_debt = bs.get('lt_debt', {}).get(latest) or 0
-    cur_lt_debt = bs.get('current_lt_debt', {}).get(latest) or 0
-    total_debt_raw = st_debt + lt_debt + cur_lt_debt
-    if total_debt_raw > 0:
-        raw_cod = int_exp / total_debt_raw
+    debt_cur = _total_debt(latest)
+    prior = years[1] if len(years) > 1 else None
+    debt_pri = _total_debt(prior) if prior else 0
+    avg_debt = (debt_cur + debt_pri) / 2 if (debt_cur + debt_pri) > 0 else 0
+    if avg_debt > 0:
+        raw_cod = int_exp / avg_debt
         implied_cod = round(min(raw_cod, 0.12), 4)
     else:
         implied_cod = 0.05
